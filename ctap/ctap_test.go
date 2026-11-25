@@ -14,13 +14,18 @@ import (
 )
 
 type dummyCTAPClient struct {
-	vault identities.IdentityVault
+	vault        identities.IdentityVault
+	pinSupported bool
+	pinHash      []byte
+	pinRetries   int32
+	keyAgreement *crypto.ECDHKey
+	pinToken     []byte
 }
 func (client *dummyCTAPClient) SupportsResidentKey() bool {
 	return true
 }
 func (client *dummyCTAPClient) SupportsPIN() bool {
-	return false
+	return client.pinSupported
 }
 
 func (client *dummyCTAPClient) NewCredentialSource(
@@ -45,18 +50,22 @@ func (client *dummyCTAPClient) CreateAttestationCertificiate(privateKey *cose.Su
 }
 
 func (client *dummyCTAPClient) PINHash() []byte {
-	return nil
+	return client.pinHash
 }
-func (client *dummyCTAPClient) SetPINHash(pin []byte) {}
+func (client *dummyCTAPClient) SetPINHash(pin []byte) {
+	client.pinHash = pin
+}
 func (client *dummyCTAPClient) PINRetries() int32 {
-	return 0
+	return client.pinRetries
 }
-func (client *dummyCTAPClient) SetPINRetries(retries int32) {}
+func (client *dummyCTAPClient) SetPINRetries(retries int32) {
+	client.pinRetries = retries
+}
 func (client *dummyCTAPClient) PINKeyAgreement() *crypto.ECDHKey {
-	return nil
+	return client.keyAgreement
 }
 func (client *dummyCTAPClient) PINToken() []byte {
-	return nil
+	return client.pinToken
 }
 
 func (client *dummyCTAPClient) ApproveAccountCreation(relyingParty string) bool {

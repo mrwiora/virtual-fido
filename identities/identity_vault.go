@@ -10,6 +10,21 @@ import (
 	"github.com/bulwarkid/virtual-fido/webauthn"
 )
 
+// HMACSecret holds the per-credential secrets of the CTAP2 hmac-secret
+// extension, which backs WebAuthn PRF. Relying parties may use PRF outputs as
+// encryption keys, so these values must never be lost or regenerated.
+type HMACSecret struct {
+	CredRandomWithUV    []byte
+	CredRandomWithoutUV []byte
+}
+
+func NewHMACSecret() *HMACSecret {
+	return &HMACSecret{
+		CredRandomWithUV:    crypto.RandomBytes(32),
+		CredRandomWithoutUV: crypto.RandomBytes(32),
+	}
+}
+
 type CredentialSource struct {
 	Type             string
 	ID               []byte
@@ -17,6 +32,8 @@ type CredentialSource struct {
 	RelyingParty     *webauthn.PublicKeyCredentialRPEntity
 	User             *webauthn.PublicKeyCrendentialUserEntity
 	SignatureCounter int32
+	// HMACSecret is nil for credentials created before hmac-secret support.
+	HMACSecret *HMACSecret
 }
 
 func (source *CredentialSource) CTAPDescriptor() webauthn.PublicKeyCredentialDescriptor {
@@ -47,6 +64,7 @@ func (vault *IdentityVault) NewIdentity(relyingParty *webauthn.PublicKeyCredenti
 		RelyingParty:     relyingParty,
 		User:             user,
 		SignatureCounter: 0,
+		HMACSecret:       NewHMACSecret(),
 	}
 	vault.AddIdentity(&credentialSource)
 	return &credentialSource
@@ -98,6 +116,10 @@ func (vault *IdentityVault) Export() []SavedCredentialSource {
 			User:             *source.User,
 			SignatureCounter: source.SignatureCounter,
 		}
+		if source.HMACSecret != nil {
+			savedSource.CredRandomWithUV = source.HMACSecret.CredRandomWithUV
+			savedSource.CredRandomWithoutUV = source.HMACSecret.CredRandomWithoutUV
+		}
 		sources = append(sources, savedSource)
 	}
 	return sources
@@ -120,6 +142,14 @@ func (vault *IdentityVault) Import(sources []SavedCredentialSource) error {
 			RelyingParty:     &source.RelyingParty,
 			User:             &source.User,
 			SignatureCounter: source.SignatureCounter,
+		}
+		// Keep whatever was stored, even if malformed: dropping it would be
+		// persisted on the next save and permanently change PRF outputs.
+		if len(source.CredRandomWithUV) > 0 || len(source.CredRandomWithoutUV) > 0 {
+			decodedSource.HMACSecret = &HMACSecret{
+				CredRandomWithUV:    source.CredRandomWithUV,
+				CredRandomWithoutUV: source.CredRandomWithoutUV,
+			}
 		}
 		vault.AddIdentity(&decodedSource)
 	}

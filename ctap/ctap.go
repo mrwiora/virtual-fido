@@ -3,6 +3,7 @@ package ctap
 import (
 	"bytes"
 	"crypto/aes"
+	"crypto/elliptic"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -57,6 +58,7 @@ const (
 	ctap2ErrInvalidCBOR          ctapStatusCode = 0x12
 	ctap2ErrNoCredentials        ctapStatusCode = 0x2E
 	ctap2ErrOperationDenied      ctapStatusCode = 0x27
+	ctap2ErrUnsupportedOption    ctapStatusCode = 0x2B
 	ctap2ErrMissingParam         ctapStatusCode = 0x14
 	ctap2ErrPINInvalid           ctapStatusCode = 0x31
 	ctap2ErrPINBlocked           ctapStatusCode = 0x32
@@ -161,14 +163,21 @@ func makeAttestedCredentialData(credentialSource *identities.CredentialSource) [
 	return util.Concat(aaguid[:], util.ToBE(uint16(len(credentialSource.ID))), credentialSource.ID, encodedCredentialPublicKey)
 }
 
-func makeAuthData(rpID string, credentialSource *identities.CredentialSource, attestedCredentialData []byte, flags authDataFlags) []byte {
+// makeAuthData builds authenticator data. extensions holds the authenticator
+// extension outputs and is omitted (along with the ED flag) when empty.
+func makeAuthData(rpID string, credentialSource *identities.CredentialSource, attestedCredentialData []byte, extensions map[string]interface{}, flags authDataFlags) []byte {
 	if attestedCredentialData != nil {
 		flags = flags | authDataFlagAttestedDataIncluded
 	} else {
 		attestedCredentialData = []byte{}
 	}
+	extensionData := []byte{}
+	if len(extensions) > 0 {
+		flags = flags | authDataFlagExtensionDataIncluded
+		extensionData = util.MarshalCBOR(extensions)
+	}
 	rpIdHash := sha256.Sum256([]byte(rpID))
-	return util.Concat(rpIdHash[:], []byte{uint8(flags)}, util.ToBE(credentialSource.SignatureCounter), attestedCredentialData)
+	return util.Concat(rpIdHash[:], []byte{uint8(flags)}, util.ToBE(credentialSource.SignatureCounter), attestedCredentialData, extensionData)
 }
 
 type makeCredentialOptions struct {
@@ -260,8 +269,13 @@ func (server *CTAPServer) handleMakeCredential(data []byte) []byte {
 		ctapLogger.Printf("ERROR: Unsupported Algorithm\n\n")
 		return []byte{byte(ctap2ErrUnsupportedAlgorithm)}
 	}
+	extensionOutputs := map[string]interface{}{}
+	if requested, ok := args.Extensions["hmac-secret"].(bool); ok && requested && credentialSource.HMACSecret != nil {
+		extensionOutputs["hmac-secret"] = true
+	}
+
 	attestedCredentialData := makeAttestedCredentialData(credentialSource)
-	authenticatorData := makeAuthData(args.RP.ID, credentialSource, attestedCredentialData, flags)
+	authenticatorData := makeAuthData(args.RP.ID, credentialSource, attestedCredentialData, extensionOutputs, flags)
 
 	attestationCert := server.client.CreateAttestationCertificiate(credentialSource.PrivateKey)
 	attestationSignature := credentialSource.PrivateKey.Sign(append(authenticatorData, args.ClientDataHash...))
@@ -289,29 +303,32 @@ type getInfoOptions struct {
 }
 
 type getInfoResponse struct {
-	Versions []string `cbor:"1,keyasint,omitempty"`
-	//Extensions []string `cbor:"2,keyasint,omitempty"`
-	AAGUID  [16]byte       `cbor:"3,keyasint,omitempty"`
-	Options getInfoOptions `cbor:"4,keyasint,omitempty"`
+	Versions   []string       `cbor:"1,keyasint,omitempty"`
+	Extensions []string       `cbor:"2,keyasint,omitempty"`
+	AAGUID     [16]byte       `cbor:"3,keyasint,omitempty"`
+	Options    getInfoOptions `cbor:"4,keyasint,omitempty"`
 	//MaxMessageSize uint32   `cbor:"5,keyasint,omitempty"`
 	PINUVAuthProtocols []uint32 `cbor:"6,keyasint,omitempty"`
 }
 
 func (server *CTAPServer) handleGetInfo() []byte {
 	response := getInfoResponse{
-		Versions: []string{"FIDO_2_0", "U2F_V2"},
-		AAGUID:   aaguid,
+		Versions:   []string{"FIDO_2_0", "U2F_V2"},
+		Extensions: []string{"hmac-secret"},
+		AAGUID:     aaguid,
 		Options: getInfoOptions{
 			IsPlatform:      false,
 			CanResidentKey:  server.client.SupportsResidentKey(),
 			CanUserPresence: true,
 			// CanUserVerification: true,
 		},
+		// Advertised even without PIN support: hmac-secret uses the PIN
+		// protocol's key agreement.
+		PINUVAuthProtocols: []uint32{1},
 	}
 	if server.client.SupportsPIN() {
 		var clientPIN bool = server.client.PINHash() != nil
 		response.Options.HasClientPIN = &clientPIN
-		response.PINUVAuthProtocols = []uint32{1}
 	}
 	ctapLogger.Printf("GET_INFO RESPONSE: %#v\n\n", response)
 	return append([]byte{byte(ctap1ErrSuccess)}, util.MarshalCBOR(response)...)
@@ -326,6 +343,7 @@ type getAssertionArgs struct {
 	RPID              string                                   `cbor:"1,keyasint"`
 	ClientDataHash    []byte                                   `cbor:"2,keyasint"`
 	AllowList         []webauthn.PublicKeyCredentialDescriptor `cbor:"3,keyasint"`
+	Extensions        map[string]cbor.RawMessage               `cbor:"4,keyasint,omitempty"`
 	Options           getAssertionOptions                      `cbor:"5,keyasint"`
 	PINUVAuthParam    []byte                                   `cbor:"6,keyasint,omitempty"`
 	PINUVAuthProtocol uint32                                   `cbor:"7,keyasint,omitempty"`
@@ -366,6 +384,22 @@ func (server *CTAPServer) handleGetAssertion(data []byte) []byte {
 		}
 	}
 
+	// Validate extension input before asking the user for approval.
+	var hmacSecret *hmacSecretRequest
+	if rawInput, ok := args.Extensions["hmac-secret"]; ok {
+		// hmac-secret requires user presence (CTAP 2.1 §12.5), so PRF values
+		// cannot be derived silently.
+		if args.Options.UserPresence != nil && !*args.Options.UserPresence {
+			return []byte{byte(ctap2ErrUnsupportedOption)}
+		}
+		var status ctapStatusCode
+		hmacSecret, status = server.parseHMACSecretInput(rawInput)
+		if status != ctap1ErrSuccess {
+			ctapLogger.Printf("ERROR: Invalid hmac-secret input: 0x%02x\n\n", status)
+			return []byte{byte(status)}
+		}
+	}
+
 	credentialSource := server.client.GetAssertionSource(args.RPID, args.AllowList)
 	unsafeCtapLogger.Printf("CREDENTIAL SOURCE: %#v\n\n", credentialSource)
 	if credentialSource == nil {
@@ -381,7 +415,13 @@ func (server *CTAPServer) handleGetAssertion(data []byte) []byte {
 		flags = flags | authDataFlagUserPresent
 	}
 
-	authData := makeAuthData(args.RPID, credentialSource, nil, flags)
+	extensionOutputs := map[string]interface{}{}
+	// Credentials without CredRandom values ignore the extension.
+	if hmacSecret != nil && credentialSource.HMACSecret != nil {
+		extensionOutputs["hmac-secret"] = hmacSecret.output(credentialSource.HMACSecret, flags&authDataFlagUserVerified != 0)
+	}
+
+	authData := makeAuthData(args.RPID, credentialSource, nil, extensionOutputs, flags)
 	signature := credentialSource.PrivateKey.Sign(util.Concat(authData, args.ClientDataHash))
 
 	credentialDescriptor := credentialSource.CTAPDescriptor()
@@ -423,6 +463,67 @@ func (server *CTAPServer) handlePINAuthProbe(relyingParty string) []byte {
 		return []byte{byte(ctap2ErrNoPINSet)}
 	}
 	return []byte{byte(ctap2ErrPINInvalid)}
+}
+
+// hmacSecretInput is the platform's input to the hmac-secret extension.
+type hmacSecretInput struct {
+	KeyAgreement      *cose.COSEEC2Key `cbor:"1,keyasint"`
+	SaltEnc           []byte           `cbor:"2,keyasint"`
+	SaltAuth          []byte           `cbor:"3,keyasint"`
+	PINUVAuthProtocol uint32           `cbor:"4,keyasint,omitempty"`
+}
+
+type hmacSecretRequest struct {
+	sharedSecret []byte
+	salts        []byte
+}
+
+// parseHMACSecretInput verifies and decrypts the hmac-secret salts using PIN
+// protocol 1 (the only protocol this authenticator supports).
+func (server *CTAPServer) parseHMACSecretInput(rawInput cbor.RawMessage) (*hmacSecretRequest, ctapStatusCode) {
+	var input hmacSecretInput
+	if err := cbor.Unmarshal(rawInput, &input); err != nil {
+		return nil, ctap2ErrInvalidCBOR
+	}
+	if input.KeyAgreement == nil || input.SaltEnc == nil || input.SaltAuth == nil {
+		return nil, ctap2ErrMissingParam
+	}
+	if input.PINUVAuthProtocol != 0 && input.PINUVAuthProtocol != 1 {
+		return nil, ctap1ErrInvalidParameter
+	}
+	sharedSecret := server.getPINSharedSecret(input.KeyAgreement)
+	if sharedSecret == nil {
+		return nil, ctap1ErrInvalidParameter
+	}
+	if !hmac.Equal(server.derivePINAuth(sharedSecret, input.SaltEnc), input.SaltAuth) {
+		return nil, ctap2ErrPINAuthInvalid
+	}
+	// Checked before decrypting, as AES-CBC needs whole blocks; the result
+	// must be one or two 32-byte salts.
+	if len(input.SaltEnc) != 32 && len(input.SaltEnc) != 64 {
+		return nil, ctap1ErrInvalidParameter
+	}
+	return &hmacSecretRequest{
+		sharedSecret: sharedSecret,
+		salts:        crypto.DecryptAESCBC(sharedSecret, input.SaltEnc),
+	}, ctap1ErrSuccess
+}
+
+// output computes HMAC-SHA-256(CredRandom, salt) for each salt, choosing the
+// CredRandom value by whether the user was verified, and encrypts the result
+// for the platform.
+func (request *hmacSecretRequest) output(secret *identities.HMACSecret, userVerified bool) []byte {
+	credRandom := secret.CredRandomWithoutUV
+	if userVerified {
+		credRandom = secret.CredRandomWithUV
+	}
+	outputs := []byte{}
+	for i := 0; i < len(request.salts); i += 32 {
+		mac := hmac.New(sha256.New, credRandom)
+		mac.Write(request.salts[i : i+32])
+		outputs = append(outputs, mac.Sum(nil)...)
+	}
+	return crypto.EncryptAESCBC(request.sharedSecret, outputs)
 }
 
 type clientPINSubcommand uint32
@@ -475,9 +576,21 @@ func (args clientPINResponse) String() string {
 		args.Retries)
 }
 
-func (server *CTAPServer) getPINSharedSecret(remoteKey cose.COSEEC2Key) []byte {
+// getPINSharedSecret derives the PIN protocol 1 shared secret from the
+// platform's key agreement key. It returns nil if the key is missing or not a
+// point on P-256; using an off-curve point would allow invalid-curve attacks
+// that leak the authenticator's key agreement private key.
+func (server *CTAPServer) getPINSharedSecret(remoteKey *cose.COSEEC2Key) []byte {
+	if remoteKey == nil || len(remoteKey.X) == 0 || len(remoteKey.Y) == 0 {
+		return nil
+	}
+	x := util.BytesToBigInt(remoteKey.X)
+	y := util.BytesToBigInt(remoteKey.Y)
+	if !elliptic.P256().IsOnCurve(x, y) {
+		return nil
+	}
 	pinKey := server.client.PINKeyAgreement()
-	return crypto.HashSHA256(pinKey.ECDH(util.BytesToBigInt(remoteKey.X), util.BytesToBigInt(remoteKey.Y)))
+	return crypto.HashSHA256(pinKey.ECDH(x, y))
 }
 
 func (server *CTAPServer) derivePINAuth(sharedSecret []byte, data []byte) []byte {
@@ -530,14 +643,16 @@ func (server *CTAPServer) decryptPIN(sharedSecret []byte, pinEncoding []byte) []
 }
 
 func (server *CTAPServer) handleClientPIN(data []byte) []byte {
-	if !server.client.SupportsPIN() {
-		return []byte{byte(ctap1ErrInvalidCommand)}
-	}
 	var args clientPINArgs
 	err := cbor.Unmarshal(data, &args)
 	if err != nil {
 		ctapLogger.Printf("ERROR: %s", err)
 		return []byte{byte(ctap2ErrInvalidCBOR)}
+	}
+	// Key agreement is also needed by extensions such as hmac-secret, so it
+	// stays available when PIN support is disabled.
+	if !server.client.SupportsPIN() && args.SubCommand != clientPinSubcommandGetKeyAgreement {
+		return []byte{byte(ctap1ErrInvalidCommand)}
 	}
 	if args.PINUVAuthProtocol != 1 {
 		return []byte{byte(ctap1ErrInvalidParameter)}
@@ -593,7 +708,10 @@ func (server *CTAPServer) handleSetPIN(args clientPINArgs) []byte {
 	if args.KeyAgreement == nil || args.PINUVAuthParam == nil || args.NewPINEncoding == nil {
 		return []byte{byte(ctap2ErrMissingParam)}
 	}
-	sharedSecret := server.getPINSharedSecret(*args.KeyAgreement)
+	sharedSecret := server.getPINSharedSecret(args.KeyAgreement)
+	if sharedSecret == nil {
+		return []byte{byte(ctap1ErrInvalidParameter)}
+	}
 	pinAuth := server.derivePINAuth(sharedSecret, args.NewPINEncoding)
 	if !bytes.Equal(pinAuth, args.PINUVAuthParam) {
 		return []byte{byte(ctap2ErrPINAuthInvalid)}
@@ -616,10 +734,16 @@ func (server *CTAPServer) handleChangePIN(args clientPINArgs) []byte {
 	if args.KeyAgreement == nil || args.PINUVAuthParam == nil || args.NewPINEncoding == nil || args.PINHashEncoding == nil {
 		return []byte{byte(ctap2ErrMissingParam)}
 	}
+	if server.client.PINHash() == nil {
+		return []byte{byte(ctap2ErrNoPINSet)}
+	}
 	if server.client.PINRetries() == 0 {
 		return []byte{byte(ctap2ErrPINBlocked)}
 	}
-	sharedSecret := server.getPINSharedSecret(*args.KeyAgreement)
+	sharedSecret := server.getPINSharedSecret(args.KeyAgreement)
+	if sharedSecret == nil {
+		return []byte{byte(ctap1ErrInvalidParameter)}
+	}
 	pinAuth := server.derivePINAuth(sharedSecret, append(args.NewPINEncoding, args.PINHashEncoding...))
 	if !bytes.Equal(pinAuth, args.PINUVAuthParam) {
 		return []byte{byte(ctap2ErrPINAuthInvalid)}
@@ -647,10 +771,16 @@ func (server *CTAPServer) handleGetPINToken(args clientPINArgs) []byte {
 	if args.PINHashEncoding == nil || args.KeyAgreement == nil {
 		return []byte{byte(ctap2ErrMissingParam)}
 	}
+	if server.client.PINHash() == nil {
+		return []byte{byte(ctap2ErrNoPINSet)}
+	}
 	if server.client.PINRetries() <= 0 {
 		return []byte{byte(ctap2ErrPINBlocked)}
 	}
-	sharedSecret := server.getPINSharedSecret(*args.KeyAgreement)
+	sharedSecret := server.getPINSharedSecret(args.KeyAgreement)
+	if sharedSecret == nil {
+		return []byte{byte(ctap1ErrInvalidParameter)}
+	}
 	server.client.SetPINRetries(server.client.PINRetries() - 1)
 	pinHash := server.decryptPINHash(sharedSecret, args.PINHashEncoding)
 	ctapLogger.Printf("TRYING PIN HASH: %v\n\n", hex.EncodeToString(pinHash))

@@ -18,6 +18,9 @@ type SavedCredentialSource struct {
 	RelyingParty     webauthn.PublicKeyCredentialRPEntity    `json:"relying_party"`
 	User             webauthn.PublicKeyCrendentialUserEntity `json:"user"`
 	SignatureCounter int32                                   `json:"signature_counter"`
+	// hmac-secret (WebAuthn PRF) secrets; absent for older credentials.
+	CredRandomWithUV    []byte `json:"cred_random_with_uv,omitempty"`
+	CredRandomWithoutUV []byte `json:"cred_random_without_uv,omitempty"`
 }
 
 type FIDODeviceConfig struct {
