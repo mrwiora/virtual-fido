@@ -162,14 +162,21 @@ func makeAttestedCredentialData(credentialSource *identities.CredentialSource) [
 	return util.Concat(aaguid[:], util.ToBE(uint16(len(credentialSource.ID))), credentialSource.ID, encodedCredentialPublicKey)
 }
 
-func makeAuthData(rpID string, credentialSource *identities.CredentialSource, attestedCredentialData []byte, flags authDataFlags) []byte {
+// makeAuthData builds authenticator data. extensions holds the authenticator
+// extension outputs and is omitted (along with the ED flag) when empty.
+func makeAuthData(rpID string, credentialSource *identities.CredentialSource, attestedCredentialData []byte, extensions map[string]interface{}, flags authDataFlags) []byte {
 	if attestedCredentialData != nil {
 		flags = flags | authDataFlagAttestedDataIncluded
 	} else {
 		attestedCredentialData = []byte{}
 	}
+	extensionData := []byte{}
+	if len(extensions) > 0 {
+		flags = flags | authDataFlagExtensionDataIncluded
+		extensionData = util.MarshalCBOR(extensions)
+	}
 	rpIdHash := sha256.Sum256([]byte(rpID))
-	return util.Concat(rpIdHash[:], []byte{uint8(flags)}, util.ToBE(credentialSource.SignatureCounter), attestedCredentialData)
+	return util.Concat(rpIdHash[:], []byte{uint8(flags)}, util.ToBE(credentialSource.SignatureCounter), attestedCredentialData, extensionData)
 }
 
 type makeCredentialOptions struct {
@@ -261,8 +268,13 @@ func (server *CTAPServer) handleMakeCredential(data []byte) []byte {
 		ctapLogger.Printf("ERROR: Unsupported Algorithm\n\n")
 		return []byte{byte(ctap2ErrUnsupportedAlgorithm)}
 	}
+	extensionOutputs := map[string]interface{}{}
+	if requested, ok := args.Extensions["hmac-secret"].(bool); ok && requested && credentialSource.HMACSecret != nil {
+		extensionOutputs["hmac-secret"] = true
+	}
+
 	attestedCredentialData := makeAttestedCredentialData(credentialSource)
-	authenticatorData := makeAuthData(args.RP.ID, credentialSource, attestedCredentialData, flags)
+	authenticatorData := makeAuthData(args.RP.ID, credentialSource, attestedCredentialData, extensionOutputs, flags)
 
 	attestationCert := server.client.CreateAttestationCertificiate(credentialSource.PrivateKey)
 	attestationSignature := credentialSource.PrivateKey.Sign(append(authenticatorData, args.ClientDataHash...))
@@ -382,7 +394,7 @@ func (server *CTAPServer) handleGetAssertion(data []byte) []byte {
 		flags = flags | authDataFlagUserPresent
 	}
 
-	authData := makeAuthData(args.RPID, credentialSource, nil, flags)
+	authData := makeAuthData(args.RPID, credentialSource, nil, nil, flags)
 	signature := credentialSource.PrivateKey.Sign(util.Concat(authData, args.ClientDataHash))
 
 	credentialDescriptor := credentialSource.CTAPDescriptor()
