@@ -303,29 +303,32 @@ type getInfoOptions struct {
 }
 
 type getInfoResponse struct {
-	Versions []string `cbor:"1,keyasint,omitempty"`
-	//Extensions []string `cbor:"2,keyasint,omitempty"`
-	AAGUID  [16]byte       `cbor:"3,keyasint,omitempty"`
-	Options getInfoOptions `cbor:"4,keyasint,omitempty"`
+	Versions   []string       `cbor:"1,keyasint,omitempty"`
+	Extensions []string       `cbor:"2,keyasint,omitempty"`
+	AAGUID     [16]byte       `cbor:"3,keyasint,omitempty"`
+	Options    getInfoOptions `cbor:"4,keyasint,omitempty"`
 	//MaxMessageSize uint32   `cbor:"5,keyasint,omitempty"`
 	PINUVAuthProtocols []uint32 `cbor:"6,keyasint,omitempty"`
 }
 
 func (server *CTAPServer) handleGetInfo() []byte {
 	response := getInfoResponse{
-		Versions: []string{"FIDO_2_0", "U2F_V2"},
-		AAGUID:   aaguid,
+		Versions:   []string{"FIDO_2_0", "U2F_V2"},
+		Extensions: []string{"hmac-secret"},
+		AAGUID:     aaguid,
 		Options: getInfoOptions{
 			IsPlatform:      false,
 			CanResidentKey:  server.client.SupportsResidentKey(),
 			CanUserPresence: true,
 			// CanUserVerification: true,
 		},
+		// Advertised even without PIN support: hmac-secret uses the PIN
+		// protocol's key agreement.
+		PINUVAuthProtocols: []uint32{1},
 	}
 	if server.client.SupportsPIN() {
 		var clientPIN bool = server.client.PINHash() != nil
 		response.Options.HasClientPIN = &clientPIN
-		response.PINUVAuthProtocols = []uint32{1}
 	}
 	ctapLogger.Printf("GET_INFO RESPONSE: %#v\n\n", response)
 	return append([]byte{byte(ctap1ErrSuccess)}, util.MarshalCBOR(response)...)

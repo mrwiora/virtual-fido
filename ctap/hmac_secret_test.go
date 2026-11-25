@@ -256,3 +256,30 @@ func TestGetAssertionHMACSecretInvalidInput(t *testing.T) {
 	code, _ = getAssertionHMACSecret(t, server, protocol2, assertionOptions{})
 	test.AssertEqual(t, code, ctap1ErrInvalidParameter, "unsupported PIN protocol accepted")
 }
+
+func getInfo(t *testing.T, server *CTAPServer) getInfoResponse {
+	t.Helper()
+	code, body := sendCTAP(t, server, ctapCommandGetInfo, nil)
+	test.AssertEqual(t, code, ctap1ErrSuccess, "getInfo failed")
+	var response getInfoResponse
+	if err := cbor.Unmarshal(body, &response); err != nil {
+		t.Fatal(err)
+	}
+	return response
+}
+
+func TestGetInfoAdvertisesHMACSecret(t *testing.T) {
+	client := newPINCapableClient()
+	server := NewCTAPServer(client)
+
+	info := getInfo(t, server)
+	test.AssertContains(t, info.Extensions, "hmac-secret", "hmac-secret not advertised")
+	test.AssertContains(t, info.PINUVAuthProtocols, uint32(1), "PIN protocol 1 not advertised")
+	test.Assert(t, info.Options.HasClientPIN != nil && !*info.Options.HasClientPIN, "clientPin should be false when no PIN is set")
+
+	client.pinSupported = false
+	info = getInfo(t, server)
+	test.AssertContains(t, info.Extensions, "hmac-secret", "hmac-secret not advertised without PIN support")
+	test.AssertContains(t, info.PINUVAuthProtocols, uint32(1), "PIN protocol 1 needed for hmac-secret key agreement")
+	test.Assert(t, info.Options.HasClientPIN == nil, "clientPin should be absent without PIN support")
+}
