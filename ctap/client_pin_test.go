@@ -70,3 +70,23 @@ func TestKeyAgreementWithoutPINSupport(t *testing.T) {
 	})
 	test.AssertEqual(t, code, ctap1ErrInvalidCommand, "getRetries allowed without PIN support")
 }
+
+func TestNoPINSet(t *testing.T) {
+	client := newPINCapableClient()
+	server := NewCTAPServer(client)
+	session := platformKeyAgreement(t, server)
+
+	code, _ := session.getPINToken(t, server, "1234")
+	test.AssertEqual(t, code, ctap2ErrNoPINSet, "getPINToken without a PIN should report PIN_NOT_SET")
+	test.AssertEqual(t, client.pinRetries, int32(8), "getPINToken without a PIN consumed a retry")
+
+	code, _ = sendCTAP(t, server, ctapCommandClientPIN, clientPINArgs{
+		PINUVAuthProtocol: 1,
+		SubCommand:        clientPINSubcommandChangePIN,
+		KeyAgreement:      &session.publicKey,
+		PINUVAuthParam:    make([]byte, 16),
+		NewPINEncoding:    make([]byte, 64),
+		PINHashEncoding:   make([]byte, 16),
+	})
+	test.AssertEqual(t, code, ctap2ErrNoPINSet, "changePIN without a PIN should report PIN_NOT_SET")
+}

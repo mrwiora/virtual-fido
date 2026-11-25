@@ -634,6 +634,9 @@ func (server *CTAPServer) handleChangePIN(args clientPINArgs) []byte {
 	if args.KeyAgreement == nil || args.PINUVAuthParam == nil || args.NewPINEncoding == nil || args.PINHashEncoding == nil {
 		return []byte{byte(ctap2ErrMissingParam)}
 	}
+	if server.client.PINHash() == nil {
+		return []byte{byte(ctap2ErrNoPINSet)}
+	}
 	if server.client.PINRetries() == 0 {
 		return []byte{byte(ctap2ErrPINBlocked)}
 	}
@@ -667,6 +670,9 @@ func (server *CTAPServer) handleChangePIN(args clientPINArgs) []byte {
 func (server *CTAPServer) handleGetPINToken(args clientPINArgs) []byte {
 	if args.PINHashEncoding == nil || args.KeyAgreement == nil {
 		return []byte{byte(ctap2ErrMissingParam)}
+	}
+	if server.client.PINHash() == nil {
+		return []byte{byte(ctap2ErrNoPINSet)}
 	}
 	if server.client.PINRetries() <= 0 {
 		return []byte{byte(ctap2ErrPINBlocked)}
