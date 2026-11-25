@@ -3,6 +3,7 @@ package ctap
 import (
 	"bytes"
 	"crypto/aes"
+	"crypto/elliptic"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -475,9 +476,21 @@ func (args clientPINResponse) String() string {
 		args.Retries)
 }
 
-func (server *CTAPServer) getPINSharedSecret(remoteKey cose.COSEEC2Key) []byte {
+// getPINSharedSecret derives the PIN protocol 1 shared secret from the
+// platform's key agreement key. It returns nil if the key is missing or not a
+// point on P-256; using an off-curve point would allow invalid-curve attacks
+// that leak the authenticator's key agreement private key.
+func (server *CTAPServer) getPINSharedSecret(remoteKey *cose.COSEEC2Key) []byte {
+	if remoteKey == nil || len(remoteKey.X) == 0 || len(remoteKey.Y) == 0 {
+		return nil
+	}
+	x := util.BytesToBigInt(remoteKey.X)
+	y := util.BytesToBigInt(remoteKey.Y)
+	if !elliptic.P256().IsOnCurve(x, y) {
+		return nil
+	}
 	pinKey := server.client.PINKeyAgreement()
-	return crypto.HashSHA256(pinKey.ECDH(util.BytesToBigInt(remoteKey.X), util.BytesToBigInt(remoteKey.Y)))
+	return crypto.HashSHA256(pinKey.ECDH(x, y))
 }
 
 func (server *CTAPServer) derivePINAuth(sharedSecret []byte, data []byte) []byte {
@@ -593,7 +606,10 @@ func (server *CTAPServer) handleSetPIN(args clientPINArgs) []byte {
 	if args.KeyAgreement == nil || args.PINUVAuthParam == nil || args.NewPINEncoding == nil {
 		return []byte{byte(ctap2ErrMissingParam)}
 	}
-	sharedSecret := server.getPINSharedSecret(*args.KeyAgreement)
+	sharedSecret := server.getPINSharedSecret(args.KeyAgreement)
+	if sharedSecret == nil {
+		return []byte{byte(ctap1ErrInvalidParameter)}
+	}
 	pinAuth := server.derivePINAuth(sharedSecret, args.NewPINEncoding)
 	if !bytes.Equal(pinAuth, args.PINUVAuthParam) {
 		return []byte{byte(ctap2ErrPINAuthInvalid)}
@@ -619,7 +635,10 @@ func (server *CTAPServer) handleChangePIN(args clientPINArgs) []byte {
 	if server.client.PINRetries() == 0 {
 		return []byte{byte(ctap2ErrPINBlocked)}
 	}
-	sharedSecret := server.getPINSharedSecret(*args.KeyAgreement)
+	sharedSecret := server.getPINSharedSecret(args.KeyAgreement)
+	if sharedSecret == nil {
+		return []byte{byte(ctap1ErrInvalidParameter)}
+	}
 	pinAuth := server.derivePINAuth(sharedSecret, append(args.NewPINEncoding, args.PINHashEncoding...))
 	if !bytes.Equal(pinAuth, args.PINUVAuthParam) {
 		return []byte{byte(ctap2ErrPINAuthInvalid)}
@@ -650,7 +669,10 @@ func (server *CTAPServer) handleGetPINToken(args clientPINArgs) []byte {
 	if server.client.PINRetries() <= 0 {
 		return []byte{byte(ctap2ErrPINBlocked)}
 	}
-	sharedSecret := server.getPINSharedSecret(*args.KeyAgreement)
+	sharedSecret := server.getPINSharedSecret(args.KeyAgreement)
+	if sharedSecret == nil {
+		return []byte{byte(ctap1ErrInvalidParameter)}
+	}
 	server.client.SetPINRetries(server.client.PINRetries() - 1)
 	pinHash := server.decryptPINHash(sharedSecret, args.PINHashEncoding)
 	ctapLogger.Printf("TRYING PIN HASH: %v\n\n", hex.EncodeToString(pinHash))
