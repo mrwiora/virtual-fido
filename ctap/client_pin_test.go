@@ -54,3 +54,19 @@ func TestClientPINRejectsInvalidKeyAgreement(t *testing.T) {
 	})
 	test.AssertEqual(t, code, ctap1ErrInvalidParameter, "empty key agreement key was accepted")
 }
+
+func TestKeyAgreementWithoutPINSupport(t *testing.T) {
+	client := newPINCapableClient()
+	client.pinSupported = false
+	server := NewCTAPServer(client)
+
+	// Succeeds (checked inside the helper) even though PIN support is off.
+	session := platformKeyAgreement(t, server)
+
+	test.AssertEqual(t, session.setPIN(t, server, "1234"), ctap1ErrInvalidCommand, "setPIN allowed without PIN support")
+	code, _ := sendCTAP(t, server, ctapCommandClientPIN, clientPINArgs{
+		PINUVAuthProtocol: 1,
+		SubCommand:        clientPINSubcommandGetRetries,
+	})
+	test.AssertEqual(t, code, ctap1ErrInvalidCommand, "getRetries allowed without PIN support")
+}

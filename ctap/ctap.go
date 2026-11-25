@@ -543,14 +543,16 @@ func (server *CTAPServer) decryptPIN(sharedSecret []byte, pinEncoding []byte) []
 }
 
 func (server *CTAPServer) handleClientPIN(data []byte) []byte {
-	if !server.client.SupportsPIN() {
-		return []byte{byte(ctap1ErrInvalidCommand)}
-	}
 	var args clientPINArgs
 	err := cbor.Unmarshal(data, &args)
 	if err != nil {
 		ctapLogger.Printf("ERROR: %s", err)
 		return []byte{byte(ctap2ErrInvalidCBOR)}
+	}
+	// Key agreement is also needed by extensions such as hmac-secret, so it
+	// stays available when PIN support is disabled.
+	if !server.client.SupportsPIN() && args.SubCommand != clientPinSubcommandGetKeyAgreement {
+		return []byte{byte(ctap1ErrInvalidCommand)}
 	}
 	if args.PINUVAuthProtocol != 1 {
 		return []byte{byte(ctap1ErrInvalidParameter)}
